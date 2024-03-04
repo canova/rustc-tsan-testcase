@@ -1,21 +1,20 @@
+use nix::libc;
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::{mem, thread, time};
+use std::{thread, time};
 
 static SHARED_VALUE: Lazy<Arc<AtomicI32>> = Lazy::new(|| Arc::new(AtomicI32::new(0)));
 
-unsafe extern "C" fn sigprof_handler(
-    _: libc::c_int,
-    _: *mut libc::siginfo_t,
-    _: *mut libc::c_void,
-) {
+extern "C" fn sigprof_handler(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
     // Modify the shared data
     SHARED_VALUE.store(1, Ordering::SeqCst);
 }
 
 fn main() {
-    let main_tid = unsafe { libc::gettid() };
+    let main_tid = nix::unistd::gettid();
     println!("[tid={}] starting", main_tid);
 
     // Setting up the signal handler.
@@ -30,8 +29,8 @@ fn main() {
 
     // Spawn a thread to wait on the futex
     let handle = std::thread::spawn(move || {
-        let tid = unsafe { libc::gettid() };
-        let pthread_self = unsafe { libc::pthread_self() };
+        let tid = nix::unistd::gettid();
+        let pthread_self = nix::sys::pthread::pthread_self();
         pthread_clone.store(pthread_self, Ordering::SeqCst);
 
         println!("[tid={}] waiting for condvar now", tid);
@@ -55,9 +54,9 @@ fn main() {
     thread::sleep(time::Duration::from_millis(100));
 
     // Send the signal to the waiting thread.
-    let res = unsafe { libc::pthread_kill(pthread, libc::SIGPROF as libc::c_int) };
+    let result = nix::sys::pthread::pthread_kill(pthread, Signal::SIGPROF);
     println!("[tid={}] sent the signal", main_tid);
-    assert!(res == 0);
+    assert!(result.is_ok());
 
     println!(
         "[tid={}] waiting for the shared value to change from the signal handler...",
@@ -82,29 +81,14 @@ fn main() {
     println!("[tid={}] test case finished as expected!", main_tid);
 }
 
-fn setup_signal_handler(main_tid: i32) {
-    let mut s = mem::MaybeUninit::<libc::sigaction>::uninit();
-    let sig_action = unsafe {
-        let p = s.as_mut_ptr();
-        (*p).sa_sigaction = sigprof_handler as usize;
-        (*p).sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
-        (*p).sa_mask = {
-            let mut sigset = mem::MaybeUninit::uninit();
-            let _ = libc::sigemptyset(sigset.as_mut_ptr());
-
-            sigset.assume_init()
-        };
-
-        s.assume_init()
-    };
-    let mut oldact = mem::MaybeUninit::<libc::sigaction>::uninit();
-    let res = unsafe {
-        libc::sigaction(
-            libc::SIGPROF as libc::c_int,
-            &sig_action as *const libc::sigaction,
-            oldact.as_mut_ptr(),
-        )
-    };
-    assert!(res == 0);
+fn setup_signal_handler(main_tid: Pid) {
+    // Setting up the signal handler.
+    let sig_action = signal::SigAction::new(
+        signal::SigHandler::SigAction(sigprof_handler),
+        signal::SaFlags::SA_RESTART,
+        signal::SigSet::empty(),
+    );
+    let result = unsafe { signal::sigaction(signal::SIGPROF, &sig_action) };
+    assert!(result.is_ok());
     println!("[tid={}] signal is set up", main_tid);
 }
