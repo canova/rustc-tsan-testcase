@@ -1,19 +1,21 @@
+#![feature(lazy_cell)]
+
 use nix::{
     libc,
     sys::signal::{self, Signal},
     unistd::Pid,
 };
-use once_cell::sync::Lazy;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Barrier,
+        LazyLock,
     },
     thread, time,
 };
 
 // Create a barrier that unlocks when it reaches to 2 wait() calls.
-static BARRIER: Lazy<Arc<Barrier>> = Lazy::new(|| Arc::new(Barrier::new(2)));
+static BARRIER: LazyLock<Arc<Barrier>> = LazyLock::new(|| Arc::new(Barrier::new(2)));
 
 extern "C" fn sigprof_handler(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
     // Notify the barrier which will unlock the waiting thread as it reaches number 2.
