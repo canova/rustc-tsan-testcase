@@ -1,15 +1,12 @@
 #![feature(lazy_cell)]
+#![feature(rustc_private)]
+extern crate libc;
 
-use nix::{
-    libc,
-    sys::signal::{self, Signal},
-    unistd::Pid,
-};
 use std::{
+    mem,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Barrier,
-        LazyLock,
+        Arc, Barrier, LazyLock,
     },
     thread, time,
 };
@@ -17,13 +14,13 @@ use std::{
 // Create a barrier that unlocks when it reaches to 2 wait() calls.
 static BARRIER: LazyLock<Arc<Barrier>> = LazyLock::new(|| Arc::new(Barrier::new(2)));
 
-extern "C" fn sigprof_handler(_: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
-    // Notify the barrier which will unlock the waiting thread as it reaches number 2.
+extern "C" fn sigprof_handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    // This second wait() call will unlock the barrier and the thread will be able to exit..
     BARRIER.wait();
 }
 
 fn main() {
-    let main_tid = nix::unistd::gettid();
+    let main_tid = unsafe { libc::gettid() };
     println!("[tid={}] starting", main_tid);
 
     // Setting up the signal handler.
@@ -38,8 +35,8 @@ fn main() {
     // Spawn a thread to wait on the futex.
     let handle = std::thread::spawn(move || {
         // Notify the main thread about the pthread ID of this thread.
-        let tid = nix::unistd::gettid();
-        let pthread_self = nix::sys::pthread::pthread_self();
+        let tid = unsafe { libc::gettid() };
+        let pthread_self = unsafe { libc::pthread_self() };
         pthread_clone.store(pthread_self, Ordering::SeqCst);
 
         println!("[tid={}] waiting for the barrier to unlock now", tid);
@@ -53,13 +50,13 @@ fn main() {
     let pthread = pthread.load(Ordering::SeqCst);
     println!("[tid={}] got the pthread {}", main_tid, pthread);
 
-    // Wait a bit just to make sure it's waiting for futex now.
+    // Wait a bit just to make sure it's waiting for the futex now.
     thread::sleep(time::Duration::from_millis(100));
 
     // Send the signal to the waiting thread.
-    let result = nix::sys::pthread::pthread_kill(pthread, Signal::SIGPROF);
+    let res = unsafe { libc::pthread_kill(pthread, libc::SIGPROF as libc::c_int) };
     println!("[tid={}] sent the signal", main_tid);
-    assert!(result.is_ok());
+    assert!(res == 0);
 
     println!("[tid={}] waiting for the thread to complete...", main_tid);
     // Wait for the thread to finish.
@@ -68,14 +65,30 @@ fn main() {
     println!("[tid={}] test case finished as expected!", main_tid);
 }
 
-fn setup_signal_handler(main_tid: Pid) {
+fn setup_signal_handler(main_tid: libc::pid_t) {
     // Setting up the signal handler.
-    let sig_action = signal::SigAction::new(
-        signal::SigHandler::SigAction(sigprof_handler),
-        signal::SaFlags::SA_RESTART,
-        signal::SigSet::empty(),
-    );
-    let result = unsafe { signal::sigaction(signal::SIGPROF, &sig_action) };
-    assert!(result.is_ok());
+    let mut s = mem::MaybeUninit::<libc::sigaction>::uninit();
+    let sig_action = unsafe {
+        let p = s.as_mut_ptr();
+        (*p).sa_sigaction = sigprof_handler as usize;
+        (*p).sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        (*p).sa_mask = {
+            let mut sigset = mem::MaybeUninit::uninit();
+            let _ = libc::sigemptyset(sigset.as_mut_ptr());
+
+            sigset.assume_init()
+        };
+
+        s.assume_init()
+    };
+    let mut oldact = mem::MaybeUninit::<libc::sigaction>::uninit();
+    let res = unsafe {
+        libc::sigaction(
+            libc::SIGPROF as libc::c_int,
+            &sig_action as *const libc::sigaction,
+            oldact.as_mut_ptr(),
+        )
+    };
+    assert!(res == 0);
     println!("[tid={}] signal is set up", main_tid);
 }
